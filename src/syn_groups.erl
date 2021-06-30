@@ -487,9 +487,8 @@ leave_on_node(GroupName, Pid, CustomEventHandler) ->
             ok
     end.
 
--spec add_to_local_table(GroupName :: any(), Pid :: pid(), Meta :: any(), MonitorRef :: undefined | reference()) -> ok.
-
 -ifdef(TEST).
+-spec add_to_local_table(GroupName :: any(), Pid :: pid(), Meta :: any(), MonitorRef :: undefined | reference()) -> ok.
 add_to_local_table(GroupName, Pid, Meta, MonitorRef) ->
     add_to_local_table(GroupName, Pid, Meta, MonitorRef, undefined).
 -endif.
