@@ -44,14 +44,14 @@
 -export([sync_join/4, sync_leave/3]).
 -export([sync_get_local_groups_tuples/1]).
 -export([force_cluster_sync/0]).
--export([remove_from_local_table/2]).
+-export([remove_from_local_table/3]).
 
 %% internal
 -export([multicast_loop/0]).
 
 %% tests
 -ifdef(TEST).
--export([add_to_local_table/4]).
+-export([add_to_local_table/5]).
 -endif.
 
 %% gen_server callbacks
@@ -253,12 +253,12 @@ force_cluster_sync() ->
 init([]) ->
     %% monitor nodes
     ok = net_kernel:monitor_nodes(true),
-    %% rebuild
-    rebuild_monitors(),
-    %% start multicast process
-    MulticastPid = spawn_link(?MODULE, multicast_loop, []),
     %% get handler
     CustomEventHandler = syn_backbone:get_event_handler_module(),
+    %% rebuild
+    rebuild_monitors(CustomEventHandler),
+    %% start multicast process
+    MulticastPid = spawn_link(?MODULE, multicast_loop, []),
     %% get anti-entropy interval
     {AntiEntropyIntervalMs, AntiEntropyIntervalMaxDeviationMs} = syn_backbone:get_anti_entropy_settings(groups),
     %% build state
@@ -286,11 +286,11 @@ init([]) ->
     {stop, Reason :: any(), Reply :: any(), #state{}} |
     {stop, Reason :: any(), #state{}}.
 
-handle_call({join_on_node, GroupName, Pid, Meta}, _From, State) ->
+handle_call({join_on_node, GroupName, Pid, Meta}, _From, #state{custom_event_handler = CustomEventhandler} = State) ->
     %% check if pid is alive
     case is_process_alive(Pid) of
         true ->
-            join_on_node(GroupName, Pid, Meta),
+            join_on_node(GroupName, Pid, Meta, CustomEventhandler),
             %% multicast
             multicast_join(GroupName, Pid, Meta, State),
             %% return
@@ -299,8 +299,8 @@ handle_call({join_on_node, GroupName, Pid, Meta}, _From, State) ->
             {reply, {error, not_alive}, State}
     end;
 
-handle_call({leave_on_node, GroupName, Pid}, _From, State) ->
-    case leave_on_node(GroupName, Pid) of
+handle_call({leave_on_node, GroupName, Pid}, _From, #state{custom_event_handler = CustomEventHandler} = State) ->
+    case leave_on_node(GroupName, Pid, CustomEventHandler) of
         ok ->
             %% multicast
             multicast_leave(GroupName, Pid, State),
@@ -323,21 +323,21 @@ handle_call(Request, From, State) ->
     {noreply, #state{}, Timeout :: non_neg_integer()} |
     {stop, Reason :: any(), #state{}}.
 
-handle_cast({sync_join, GroupName, Pid, Meta}, State) ->
+handle_cast({sync_join, GroupName, Pid, Meta}, #state{custom_event_handler = CustomEventHandler} = State) ->
     %% add to table
-    add_to_local_table(GroupName, Pid, Meta, undefined),
+    add_to_local_table(GroupName, Pid, Meta, undefined, CustomEventHandler),
     %% return
     {noreply, State};
 
-handle_cast({sync_leave, GroupName, Pid}, State) ->
+handle_cast({sync_leave, GroupName, Pid}, #state{custom_event_handler = CustomEventHandler} = State) ->
     %% remove entry
-    remove_from_local_table(GroupName, Pid),
+    remove_from_local_table(GroupName, Pid, CustomEventHandler),
     %% return
     {noreply, State};
 
-handle_cast(force_cluster_sync, State) ->
+handle_cast(force_cluster_sync, #state{custom_event_handler = CustomEventHandler} = State) ->
     error_logger:info_msg("Syn(~p): Initiating full cluster groups FORCED sync for nodes: ~p~n", [node(), nodes()]),
-    do_sync_from_full_cluster(),
+    do_sync_from_full_cluster(CustomEventHandler),
     {noreply, State};
 
 handle_cast(Msg, State) ->
@@ -352,7 +352,7 @@ handle_cast(Msg, State) ->
     {noreply, #state{}, Timeout :: non_neg_integer()} |
     {stop, Reason :: any(), #state{}}.
 
-handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
+handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, #state{custom_event_handler = CustomEventhandler} = State) ->
     case find_groups_tuples_by_pid(Pid) of
         [] ->
             %% handle
@@ -361,7 +361,7 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
         GroupTuples ->
             lists:foreach(fun({GroupName, _Pid, Meta}) ->
                 %% remove from table
-                remove_from_local_table(GroupName, Pid),
+                remove_from_local_table(GroupName, Pid, CustomEventhandler),
                 %% handle
                 handle_process_down(GroupName, Pid, Meta, Reason, State),
                 %% multicast
@@ -371,9 +371,9 @@ handle_info({'DOWN', _MonitorRef, process, Pid, Reason}, State) ->
     %% return
     {noreply, State};
 
-handle_info({nodeup, RemoteNode}, State) ->
+handle_info({nodeup, RemoteNode}, #state{custom_event_handler = CustomEventHandler}= State) ->
     error_logger:info_msg("Syn(~p): Node ~p has joined the cluster~n", [node(), RemoteNode]),
-    groups_automerge(RemoteNode),
+    groups_automerge(RemoteNode, CustomEventHandler),
     %% resume
     {noreply, State};
 
@@ -382,19 +382,19 @@ handle_info({nodedown, RemoteNode}, State) ->
     raw_purge_group_entries_for_node(RemoteNode),
     {noreply, State};
 
-handle_info(sync_from_full_cluster, State) ->
+handle_info(sync_from_full_cluster,  #state{custom_event_handler = CustomEventHandler} = State) ->
     error_logger:info_msg("Syn(~p): Initiating full cluster groups sync for nodes: ~p~n", [node(), nodes()]),
-    do_sync_from_full_cluster(),
+    do_sync_from_full_cluster(CustomEventHandler),
     {noreply, State};
 
-handle_info(sync_anti_entropy, State) ->
+handle_info(sync_anti_entropy, #state{custom_event_handler = CustomEventHandler} = State) ->
     %% sync
     RemoteNodes = nodes(),
     case length(RemoteNodes) > 0 of
         true ->
             RandomRemoteNode = lists:nth(rand:uniform(length(RemoteNodes)), RemoteNodes),
             error_logger:info_msg("Syn(~p): Initiating anti-entropy sync for node ~p~n", [node(), RandomRemoteNode]),
-            groups_automerge(RandomRemoteNode);
+            groups_automerge(RandomRemoteNode, CustomEventHandler);
 
         _ ->
             ok
@@ -441,8 +441,8 @@ multicast_leave(GroupName, Pid, #state{
 }) ->
     MulticastPid ! {multicast_leave, GroupName, Pid}.
 
--spec join_on_node(GroupName :: any(), Pid :: pid(), Meta :: any()) -> ok.
-join_on_node(GroupName, Pid, Meta) ->
+-spec join_on_node(GroupName :: any(), Pid :: pid(), Meta :: any(), CustomEventhandler::module()) -> ok.
+join_on_node(GroupName, Pid, Meta, CustomEventHandler) ->
     MonitorRef = case find_monitor_for_pid(Pid) of
         undefined ->
             %% process is not monitored yet, add
@@ -452,10 +452,10 @@ join_on_node(GroupName, Pid, Meta) ->
             MRef
     end,
     %% add to table
-    add_to_local_table(GroupName, Pid, Meta, MonitorRef).
+    add_to_local_table(GroupName, Pid, Meta, MonitorRef, CustomEventHandler).
 
--spec leave_on_node(GroupName :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
-leave_on_node(GroupName, Pid) ->
+-spec leave_on_node(GroupName :: any(), Pid :: pid(), CustomEventhandler::module()) -> ok | {error, Reason :: any()}.
+leave_on_node(GroupName, Pid, CustomEventHandler) ->
     case find_groups_entry_by_name_and_pid(GroupName, Pid) of
         undefined ->
             {error, not_in_group};
@@ -471,7 +471,7 @@ leave_on_node(GroupName, Pid) ->
                     ok
             end,
             %% remove from table
-            remove_from_local_table(GroupName, Pid);
+            remove_from_local_table(GroupName, Pid, CustomEventHandler);
 
         {GroupName, Pid, _Meta, _MonitorRef, Node} = GroupsEntry when Node =:= node() ->
             error_logger:error_msg(
@@ -479,7 +479,7 @@ leave_on_node(GroupName, Pid) ->
                 [node(), GroupsEntry]
             ),
             %% remove from table
-            remove_from_local_table(GroupName, Pid);
+            remove_from_local_table(GroupName, Pid, CustomEventHandler);
 
         _ ->
             %% race condition: leave request but entry in table is not a local pid (has no monitor)
@@ -488,20 +488,28 @@ leave_on_node(GroupName, Pid) ->
     end.
 
 -spec add_to_local_table(GroupName :: any(), Pid :: pid(), Meta :: any(), MonitorRef :: undefined | reference()) -> ok.
+
+-ifdef(TEST).
 add_to_local_table(GroupName, Pid, Meta, MonitorRef) ->
+    add_to_local_table(GroupName, Pid, Meta, MonitorRef, undefined).
+-endif.
+
+-spec add_to_local_table(GroupName :: any(), Pid :: pid(), Meta :: any(), MonitorRef :: undefined | reference(), CustomEventhandler::module()) -> ok.
+add_to_local_table(GroupName, Pid, Meta, MonitorRef, CustomEventHandler) ->
     ets:insert(syn_groups_by_name, {{GroupName, Pid}, Meta, MonitorRef, node(Pid)}),
     ets:insert(syn_groups_by_pid, {{Pid, GroupName}, Meta, MonitorRef, node(Pid)}),
+    syn_event_handler:do_on_process_join_group(GroupName, Pid, CustomEventHandler),
     ok.
 
--spec remove_from_local_table(GroupName :: any(), Pid :: pid()) -> ok | {error, Reason :: any()}.
-remove_from_local_table(GroupName, Pid) ->
+-spec remove_from_local_table(GroupName :: any(), Pid :: pid(), CustomEventHandler::module()) -> ok | {error, Reason :: any()}.
+remove_from_local_table(GroupName, Pid, CustomEventHandler) ->
     case ets:lookup(syn_groups_by_name, {GroupName, Pid}) of
         [] ->
             {error, not_in_group};
-
         _ ->
             ets:match_delete(syn_groups_by_name, {{GroupName, Pid}, '_', '_', '_'}),
             ets:match_delete(syn_groups_by_pid, {{Pid, GroupName}, '_', '_', '_'}),
+            syn_event_handler:do_on_process_leave_group(GroupName, Pid, CustomEventHandler),
             ok
     end.
 
@@ -557,8 +565,8 @@ handle_process_down(GroupName, Pid, Meta, Reason, #state{
             syn_event_handler:do_on_group_process_exit(GroupName, Pid, Meta, Reason, CustomEventHandler)
     end.
 
--spec groups_automerge(RemoteNode :: node()) -> ok.
-groups_automerge(RemoteNode) ->
+-spec groups_automerge(RemoteNode :: node(), CustomEventhandler::module()) -> ok.
+groups_automerge(RemoteNode, CustomEventHandler) ->
     global:trans({{?MODULE, auto_merge_groups}, self()},
         fun() ->
             error_logger:info_msg("Syn(~p): GROUPS AUTOMERGE ----> Initiating for remote node ~p~n", [node(), RemoteNode]),
@@ -578,9 +586,9 @@ groups_automerge(RemoteNode) ->
                     lists:foreach(fun({GroupName, RemotePid, RemoteMeta}) ->
                         case rpc:call(node(RemotePid), erlang, is_process_alive, [RemotePid]) of
                             true ->
-                                add_to_local_table(GroupName, RemotePid, RemoteMeta, undefined);
+                                add_to_local_table(GroupName, RemotePid, RemoteMeta, undefined, CustomEventHandler);
                             _ ->
-                                ok = rpc:call(RemoteNode, syn_groups, remove_from_local_table, [GroupName, RemotePid])
+                                ok = rpc:call(RemoteNode, syn_groups, remove_from_local_table, [GroupName, RemotePid, CustomEventHandler])
                         end
                     end, GroupTuples),
                     %% exit
@@ -589,10 +597,10 @@ groups_automerge(RemoteNode) ->
         end
     ).
 
--spec do_sync_from_full_cluster() -> ok.
-do_sync_from_full_cluster() ->
+-spec do_sync_from_full_cluster(CustomEventHandler::module()) -> ok.
+do_sync_from_full_cluster(CustomEventHandler) ->
     lists:foreach(fun(RemoteNode) ->
-        groups_automerge(RemoteNode)
+        groups_automerge(RemoteNode, CustomEventHandler)
     end, nodes()).
 
 -spec raw_purge_group_entries_for_node(Node :: atom()) -> ok.
@@ -639,8 +647,8 @@ collect_replies(MemberPids, Replies, BadPids) ->
             collect_replies(MemberPids1, Replies, [Pid | BadPids])
     end.
 
--spec rebuild_monitors() -> ok.
-rebuild_monitors() ->
+-spec rebuild_monitors(CustomEventHandler::module()) -> ok.
+rebuild_monitors(CustomEventHandler) ->
     GroupTuples = get_groups_tuples_for_node(node()),
     %% ensure that groups doesn't have any joining node's entries
     raw_purge_group_entries_for_node(node()),
@@ -648,9 +656,9 @@ rebuild_monitors() ->
     lists:foreach(fun({GroupName, Pid, Meta}) ->
         case erlang:is_process_alive(Pid) of
             true ->
-                join_on_node(GroupName, Pid, Meta);
+                join_on_node(GroupName, Pid, Meta, CustomEventHandler);
             _ ->
-                remove_from_local_table(GroupName, Pid)
+                remove_from_local_table(GroupName, Pid, CustomEventHandler)
         end
     end, GroupTuples).
 

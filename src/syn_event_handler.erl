@@ -31,6 +31,11 @@
 -export([do_on_process_exit/5]).
 -export([do_on_group_process_exit/5]).
 -export([do_resolve_registry_conflict/4]).
+-export([do_on_process_join_group/3]).
+-export([do_on_process_leave_group/3]).
+
+-callback on_process_join_group(GroupName :: any(), Pid :: pid()) -> any().
+-callback on_process_leave_group(GroupName :: any(), Pid :: pid()) -> any().
 
 -callback on_process_exit(
     Name :: any(),
@@ -57,6 +62,25 @@
 %% ===================================================================
 %% API
 %% ===================================================================
+
+-spec do_on_process_join_group(GroupName :: any(), Pid :: pid(), CustomEventHandler::module()) -> any().
+do_on_process_join_group(GroupName, Pid, CustomEventHandler) ->
+    case erlang:function_exported(CustomEventHandler, on_process_join_group, 2) of
+        true ->
+            spawn(fun() -> CustomEventHandler:on_process_join_group(GroupName, Pid) end);
+        _ ->
+            ok
+    end.
+
+-spec do_on_process_leave_group(GroupName :: any(), Pid :: pid(), CustomEventHandler::module()) -> any().
+do_on_process_leave_group(GroupName, Pid, CustomEventHandler) ->
+    case erlang:function_exported(CustomEventHandler, on_process_leave_group, 2) of
+        true ->
+            spawn(fun() -> CustomEventHandler:on_process_leave_group(GroupName, Pid) end);
+        _ ->
+            ok
+    end.
+
 -spec do_on_process_exit(
     Name :: any(),
     Pid :: pid(),
