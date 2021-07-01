@@ -57,7 +57,8 @@
     {Pid2 :: pid(), Meta2 :: any()}
 ) -> PidToKeep :: pid() | undefined.
 
--optional_callbacks([on_process_exit/4, on_group_process_exit/4, resolve_registry_conflict/3]).
+-optional_callbacks([on_process_exit/4, on_group_process_exit/4, resolve_registry_conflict/3,
+                     on_process_join_group/2, on_process_leave_group/2]).
 
 %% ===================================================================
 %% API
